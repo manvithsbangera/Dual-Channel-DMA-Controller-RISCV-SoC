@@ -1,0 +1,20 @@
+//-----------------------------------------------------------------
+// counter_defs.v
+// Register map for the DMA peripheral
+// Base address: 0x95000000
+//-----------------------------------------------------------------
+
+// DMA control registers (offsets 0x00 - 0x14)
+`define CNT_DMA_SRC        8'h00   // [31:0]  source byte address in dma_mem
+`define CNT_DMA_DST        8'h04   // [31:0]  destination byte address in dma_mem
+`define CNT_DMA_LEN        8'h08   // [7:0]   transfer length in words
+`define CNT_DMA_MODE       8'h0C   // [0]     0=SINGLE 1=BURST
+`define CNT_DMA_CTRL       8'h10   // [0]     write 1 to start
+`define CNT_DMA_STATUS     8'h14   // [1:0]   bit0=busy bit1=done
+
+// DMA internal BRAM access via AXI (offsets 0x20 and above)
+// CPU writes source data here before DMA, reads dest data after DMA
+// dma_mem word index = (cfg_addr - 0x20) >> 2
+// Source region : dma_mem[0..15]  -> AXI offset 0x20..0x5C
+// Dest   region : dma_mem[16..31] -> AXI offset 0x60..0x9C
+`define CNT_DMA_MEM_BASE   8'h20

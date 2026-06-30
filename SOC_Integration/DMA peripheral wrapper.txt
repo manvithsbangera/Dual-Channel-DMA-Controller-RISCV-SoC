@@ -1,0 +1,518 @@
+//-----------------------------------------------------------------
+// counter.v
+// DMA peripheral - replaces the original 4-bit counter peripheral.
+//
+// Port list is IDENTICAL to the original counter module as instantiated
+// in soc.v:
+//   clk_i, rst_i
+//   cfg_aw*, cfg_w*, cfg_b*, cfg_ar*, cfg_r*   (AXI4-Lite slave)
+//   count_o [3:0]                               (tied to STATUS bits)
+//
+// Change vs previous version:
+//   AXI read/write access to dma_mem[] added at offset >= 0x20
+//   This lets the CPU write source data and read destination data
+//   so REAL DMA transfers can be proven from firmware.
+//
+// Memory map:
+//   0x00  DMA_SRC    - source byte address (within dma_mem)
+//   0x04  DMA_DST    - destination byte address (within dma_mem)
+//   0x08  DMA_LEN    - transfer length in words
+//   0x0C  DMA_MODE   - 0=SINGLE 1=BURST
+//   0x10  DMA_CTRL   - write 1 to start
+//   0x14  DMA_STATUS - bit0=busy bit1=done
+//   0x20+ dma_mem[]  - direct CPU access to DMA working memory
+//                      word N = offset 0x20 + N*4
+//                      Source region: words  0-15 (offsets 0x20-0x5C)
+//                      Dest   region: words 16-31 (offsets 0x60-0x9C)
+//-----------------------------------------------------------------
+
+//=================================================================
+// 1. dma_arbiter
+//=================================================================
+module dma_arbiter (
+    input  wire clk,
+    input  wire rst_n,
+    input  wire req0,
+    input  wire req1,
+    output reg  grant0,
+    output reg  grant1
+);
+    reg last_served;
+    reg grant_active;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            grant0       <= 1'b0;
+            grant1       <= 1'b0;
+            last_served  <= 1'b0;
+            grant_active <= 1'b0;
+        end
+        else begin
+            if (grant_active) begin
+                if (grant0 && !req0) begin
+                    grant0       <= 1'b0;
+                    grant_active <= 1'b0;
+                end
+                else if (grant1 && !req1) begin
+                    grant1       <= 1'b0;
+                    grant_active <= 1'b0;
+                end
+            end
+            else begin
+                case ({req1, req0})
+                    2'b00: begin grant0 <= 1'b0; grant1 <= 1'b0; end
+                    2'b01: begin
+                        grant0 <= 1'b1; grant1 <= 1'b0;
+                        last_served <= 1'b0; grant_active <= 1'b1;
+                    end
+                    2'b10: begin
+                        grant0 <= 1'b0; grant1 <= 1'b1;
+                        last_served <= 1'b1; grant_active <= 1'b1;
+                    end
+                    2'b11: begin
+                        if (last_served == 1'b0) begin
+                            grant0 <= 1'b0; grant1 <= 1'b1; last_served <= 1'b1;
+                        end else begin
+                            grant0 <= 1'b1; grant1 <= 1'b0; last_served <= 1'b0;
+                        end
+                        grant_active <= 1'b1;
+                    end
+                    default: begin grant0 <= 1'b0; grant1 <= 1'b0; end
+                endcase
+            end
+        end
+    end
+endmodule
+
+//=================================================================
+// 2. dma_channel
+//=================================================================
+module dma_channel #(
+    parameter DATA_WIDTH = 32,
+    parameter ADDR_WIDTH = 32,
+    parameter LEN_WIDTH  = 8,
+    parameter BUF_DEPTH  = 256
+)(
+    input  wire                  clk,
+    input  wire                  rst_n,
+    input  wire                  start,
+    input  wire                  mode,
+    input  wire [ADDR_WIDTH-1:0] src_addr,
+    input  wire [ADDR_WIDTH-1:0] dst_addr,
+    input  wire [LEN_WIDTH-1:0]  transfer_len,
+    output reg                   busy,
+    output reg                   done,
+    output reg                   bus_req,
+    input  wire                  bus_grant,
+    output reg                   bus_read,
+    output reg                   bus_write,
+    output reg  [ADDR_WIDTH-1:0] bus_addr,
+    output reg  [DATA_WIDTH-1:0] bus_wdata,
+    input  wire [DATA_WIDTH-1:0] bus_rdata,
+    input  wire                  bus_ready
+);
+    localparam [2:0]
+        S_IDLE      = 3'd0,
+        S_REQ_BUS   = 3'd1,
+        S_SINGLE_RD = 3'd2,
+        S_SINGLE_WR = 3'd3,
+        S_BURST_RD  = 3'd4,
+        S_BURST_WR  = 3'd5,
+        S_DONE      = 3'd6;
+
+    reg [2:0]            state;
+    reg [ADDR_WIDTH-1:0] src_ptr;
+    reg [ADDR_WIDTH-1:0] dst_ptr;
+    reg [LEN_WIDTH-1:0]  words_remaining;
+    reg [LEN_WIDTH-1:0]  total_len;
+    reg                  mode_latch;
+    reg [DATA_WIDTH-1:0] single_rdata_cap;
+    reg [LEN_WIDTH-1:0]  burst_rd_cnt;
+    reg [LEN_WIDTH-1:0]  burst_wr_cnt;
+    reg                  rd_issued;
+    reg                  wr_issued;
+
+    reg [DATA_WIDTH-1:0] burst_buffer [0:BUF_DEPTH-1];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_IDLE; busy <= 1'b0; done <= 1'b0;
+            bus_req <= 1'b0; bus_read <= 1'b0; bus_write <= 1'b0;
+            bus_addr <= {ADDR_WIDTH{1'b0}}; bus_wdata <= {DATA_WIDTH{1'b0}};
+            src_ptr <= {ADDR_WIDTH{1'b0}}; dst_ptr <= {ADDR_WIDTH{1'b0}};
+            words_remaining <= {LEN_WIDTH{1'b0}}; total_len <= {LEN_WIDTH{1'b0}};
+            mode_latch <= 1'b0; single_rdata_cap <= {DATA_WIDTH{1'b0}};
+            burst_rd_cnt <= {LEN_WIDTH{1'b0}}; burst_wr_cnt <= {LEN_WIDTH{1'b0}};
+            rd_issued <= 1'b0; wr_issued <= 1'b0;
+        end
+        else begin
+            done <= 1'b0; bus_read <= 1'b0; bus_write <= 1'b0;
+            case (state)
+                S_IDLE: begin
+                    busy <= 1'b0; bus_req <= 1'b0;
+                    rd_issued <= 1'b0; wr_issued <= 1'b0;
+                    if (start) begin
+                        src_ptr <= src_addr; dst_ptr <= dst_addr;
+                        total_len <= transfer_len; words_remaining <= transfer_len;
+                        mode_latch <= mode;
+                        burst_rd_cnt <= {LEN_WIDTH{1'b0}};
+                        burst_wr_cnt <= {LEN_WIDTH{1'b0}};
+                        busy <= 1'b1; state <= S_REQ_BUS;
+                    end
+                end
+                S_REQ_BUS: begin
+                    bus_req <= 1'b1; rd_issued <= 1'b0; wr_issued <= 1'b0;
+                    if (bus_grant)
+                        state <= (mode_latch) ? S_BURST_RD : S_SINGLE_RD;
+                end
+                S_SINGLE_RD: begin
+                    bus_req <= 1'b1;
+                    if (!rd_issued) begin
+                        bus_read <= 1'b1; bus_addr <= src_ptr; rd_issued <= 1'b1;
+                    end
+                    if (bus_ready) begin
+                        single_rdata_cap <= bus_rdata; rd_issued <= 1'b0;
+                        state <= S_SINGLE_WR;
+                    end
+                end
+                S_SINGLE_WR: begin
+                    bus_req <= 1'b1;
+                    if (!wr_issued) begin
+                        bus_write <= 1'b1; bus_addr <= dst_ptr;
+                        bus_wdata <= single_rdata_cap; wr_issued <= 1'b1;
+                    end
+                    if (bus_ready) begin
+                        src_ptr <= src_ptr + 4; dst_ptr <= dst_ptr + 4;
+                        words_remaining <= words_remaining - 1; wr_issued <= 1'b0;
+                        bus_req <= 1'b0;
+                        state <= (words_remaining == 8'd1) ? S_DONE : S_REQ_BUS;
+                    end
+                end
+                S_BURST_RD: begin
+                    bus_req <= 1'b1;
+                    if (!rd_issued) begin
+                        bus_read <= 1'b1; bus_addr <= src_ptr; rd_issued <= 1'b1;
+                    end
+                    if (bus_ready) begin
+                        burst_buffer[burst_rd_cnt] <= bus_rdata;
+                        burst_rd_cnt <= burst_rd_cnt + 1;
+                        src_ptr <= src_ptr + 4; rd_issued <= 1'b0;
+                        if (burst_rd_cnt == total_len - 1)
+                            state <= S_BURST_WR;
+                    end
+                end
+                S_BURST_WR: begin
+                    bus_req <= 1'b1;
+                    if (!wr_issued) begin
+                        bus_write <= 1'b1; bus_addr <= dst_ptr;
+                        bus_wdata <= burst_buffer[burst_wr_cnt]; wr_issued <= 1'b1;
+                    end
+                    if (bus_ready) begin
+                        dst_ptr <= dst_ptr + 4;
+                        burst_wr_cnt <= burst_wr_cnt + 1; wr_issued <= 1'b0;
+                        if (burst_wr_cnt == total_len - 1) begin
+                            bus_req <= 1'b0; state <= S_DONE;
+                        end
+                    end
+                end
+                S_DONE: begin
+                    done <= 1'b1; busy <= 1'b0; bus_req <= 1'b0; state <= S_IDLE;
+                end
+                default: begin state <= S_IDLE; busy <= 1'b0; bus_req <= 1'b0; end
+            endcase
+        end
+    end
+endmodule
+
+//=================================================================
+// 3. dma_top
+//=================================================================
+module dma_top #(
+    parameter DATA_WIDTH = 32,
+    parameter ADDR_WIDTH = 32,
+    parameter LEN_WIDTH  = 8,
+    parameter BUF_DEPTH  = 256
+)(
+    input  wire                  clk,
+    input  wire                  rst_n,
+    input  wire                  ch0_start,
+    input  wire                  ch0_mode,
+    input  wire [ADDR_WIDTH-1:0] ch0_src_addr,
+    input  wire [ADDR_WIDTH-1:0] ch0_dst_addr,
+    input  wire [LEN_WIDTH-1:0]  ch0_transfer_len,
+    output wire                  ch0_busy,
+    output wire                  ch0_done,
+    input  wire                  ch1_start,
+    input  wire                  ch1_mode,
+    input  wire [ADDR_WIDTH-1:0] ch1_src_addr,
+    input  wire [ADDR_WIDTH-1:0] ch1_dst_addr,
+    input  wire [LEN_WIDTH-1:0]  ch1_transfer_len,
+    output wire                  ch1_busy,
+    output wire                  ch1_done,
+    output reg                   bus_read,
+    output reg                   bus_write,
+    output reg  [ADDR_WIDTH-1:0] bus_addr,
+    output reg  [DATA_WIDTH-1:0] bus_wdata,
+    input  wire [DATA_WIDTH-1:0] bus_rdata,
+    input  wire                  bus_ready
+);
+    wire        ch0_bus_req,   ch1_bus_req;
+    wire        ch0_bus_read,  ch1_bus_read;
+    wire        ch0_bus_write, ch1_bus_write;
+    wire [ADDR_WIDTH-1:0] ch0_bus_addr,  ch1_bus_addr;
+    wire [DATA_WIDTH-1:0] ch0_bus_wdata, ch1_bus_wdata;
+    wire grant0, grant1;
+
+    dma_channel #(.DATA_WIDTH(DATA_WIDTH),.ADDR_WIDTH(ADDR_WIDTH),
+                  .LEN_WIDTH(LEN_WIDTH),.BUF_DEPTH(BUF_DEPTH)) u_ch0 (
+        .clk(clk),.rst_n(rst_n),
+        .start(ch0_start),.mode(ch0_mode),
+        .src_addr(ch0_src_addr),.dst_addr(ch0_dst_addr),
+        .transfer_len(ch0_transfer_len),
+        .busy(ch0_busy),.done(ch0_done),
+        .bus_req(ch0_bus_req),.bus_grant(grant0),
+        .bus_read(ch0_bus_read),.bus_write(ch0_bus_write),
+        .bus_addr(ch0_bus_addr),.bus_wdata(ch0_bus_wdata),
+        .bus_rdata(bus_rdata),.bus_ready(bus_ready & grant0)
+    );
+
+    dma_channel #(.DATA_WIDTH(DATA_WIDTH),.ADDR_WIDTH(ADDR_WIDTH),
+                  .LEN_WIDTH(LEN_WIDTH),.BUF_DEPTH(BUF_DEPTH)) u_ch1 (
+        .clk(clk),.rst_n(rst_n),
+        .start(ch1_start),.mode(ch1_mode),
+        .src_addr(ch1_src_addr),.dst_addr(ch1_dst_addr),
+        .transfer_len(ch1_transfer_len),
+        .busy(ch1_busy),.done(ch1_done),
+        .bus_req(ch1_bus_req),.bus_grant(grant1),
+        .bus_read(ch1_bus_read),.bus_write(ch1_bus_write),
+        .bus_addr(ch1_bus_addr),.bus_wdata(ch1_bus_wdata),
+        .bus_rdata(bus_rdata),.bus_ready(bus_ready & grant1)
+    );
+
+    dma_arbiter u_arb (
+        .clk(clk),.rst_n(rst_n),
+        .req0(ch0_bus_req),.req1(ch1_bus_req),
+        .grant0(grant0),.grant1(grant1)
+    );
+
+    always @(*) begin
+        if (grant0) begin
+            bus_read=ch0_bus_read; bus_write=ch0_bus_write;
+            bus_addr=ch0_bus_addr; bus_wdata=ch0_bus_wdata;
+        end else if (grant1) begin
+            bus_read=ch1_bus_read; bus_write=ch1_bus_write;
+            bus_addr=ch1_bus_addr; bus_wdata=ch1_bus_wdata;
+        end else begin
+            bus_read=1'b0; bus_write=1'b0;
+            bus_addr={ADDR_WIDTH{1'b0}}; bus_wdata={DATA_WIDTH{1'b0}};
+        end
+    end
+endmodule
+
+//=================================================================
+// 4. counter  - AXI4-Lite wrapper
+//    Port names EXACTLY as instantiated in soc.v
+//=================================================================
+module counter
+(
+     input           clk_i
+    ,input           rst_i
+    ,input  [ 31:0]  cfg_awaddr_i
+    ,input           cfg_awvalid_i
+    ,output          cfg_awready_o
+    ,input  [ 31:0]  cfg_wdata_i
+    ,input  [  3:0]  cfg_wstrb_i
+    ,input           cfg_wvalid_i
+    ,output          cfg_wready_o
+    ,output [  1:0]  cfg_bresp_o
+    ,output          cfg_bvalid_o
+    ,input           cfg_bready_i
+    ,input  [ 31:0]  cfg_araddr_i
+    ,input           cfg_arvalid_i
+    ,output          cfg_arready_o
+    ,output [ 31:0]  cfg_rdata_o
+    ,output [  1:0]  cfg_rresp_o
+    ,output          cfg_rvalid_o
+    ,input           cfg_rready_i
+    ,output [  3:0]  count_o
+);
+
+`include "counter_defs.v"
+
+    // ----------------------------------------------------------------
+    // AXI handshake
+    // ----------------------------------------------------------------
+    wire write_en_w = cfg_awvalid_i & cfg_awready_o;
+    wire read_en_w  = cfg_arvalid_i & cfg_arready_o;
+
+    assign cfg_arready_o = ~cfg_rvalid_o;
+    assign cfg_awready_o = ~cfg_bvalid_o && ~cfg_arvalid_i;
+    assign cfg_wready_o  = cfg_awready_o;
+    assign cfg_bresp_o   = 2'b00;
+    assign cfg_rresp_o   = 2'b00;
+
+    // ----------------------------------------------------------------
+    // DMA shadow registers
+    // ----------------------------------------------------------------
+    reg [31:0] reg_src;
+    reg [31:0] reg_dst;
+    reg [7:0]  reg_len;
+    reg        reg_mode;
+    reg        reg_ctrl_start;
+
+    // ----------------------------------------------------------------
+    // Internal 256 x 32-bit DMA working memory
+    // ----------------------------------------------------------------
+    (* ram_style = "distributed" *)
+    reg [31:0] dma_mem [0:255];
+
+    wire        dma_bus_read;
+    wire        dma_bus_write;
+    wire [31:0] dma_bus_addr;
+    wire [31:0] dma_bus_wdata;
+    reg  [31:0] dma_bus_rdata;
+    reg         dma_bus_ready;
+    reg         dma_access_d;
+
+    wire [7:0] mem_waddr = dma_bus_addr[9:2];
+
+    // ----------------------------------------------------------------
+    // Single always block owns ALL writes to dma_mem[]
+    // Priority: DMA bus write > AXI CPU write (DMA active = bus busy)
+    // Also handles DMA bus ready pipeline and AXI control registers
+    // ----------------------------------------------------------------
+    always @(posedge clk_i or posedge rst_i) begin
+        if (rst_i) begin
+            dma_access_d   <= 1'b0;
+            dma_bus_ready  <= 1'b0;
+            dma_bus_rdata  <= 32'h0;
+            reg_src        <= 32'h0;
+            reg_dst        <= 32'h0;
+            reg_len        <= 8'h0;
+            reg_mode       <= 1'b0;
+            reg_ctrl_start <= 1'b0;
+        end
+        else begin
+            // DMA bus ready pipeline
+            dma_access_d  <= dma_bus_read | dma_bus_write;
+            dma_bus_ready <= dma_access_d;
+
+            // DMA bus read data
+            dma_bus_rdata <= dma_mem[mem_waddr];
+
+            // DMA bus write has priority (DMA engine owns the memory)
+            if (dma_bus_write && !dma_access_d)
+                dma_mem[mem_waddr] <= dma_bus_wdata;
+
+            // AXI control register writes and CPU dma_mem window writes
+            reg_ctrl_start <= 1'b0;
+            if (write_en_w) begin
+                if (cfg_awaddr_i[7:0] >= 8'h20) begin
+                    // CPU write into dma_mem[] - only when DMA not writing
+                    if (!dma_bus_write)
+                        dma_mem[(cfg_awaddr_i[7:0] - 8'h20) >> 2] <= cfg_wdata_i;
+                end
+                else begin
+                    case (cfg_awaddr_i[7:0])
+                        `CNT_DMA_SRC:  reg_src        <= cfg_wdata_i;
+                        `CNT_DMA_DST:  reg_dst        <= cfg_wdata_i;
+                        `CNT_DMA_LEN:  reg_len        <= cfg_wdata_i[7:0];
+                        `CNT_DMA_MODE: reg_mode       <= cfg_wdata_i[0];
+                        `CNT_DMA_CTRL: reg_ctrl_start <= cfg_wdata_i[0];
+                        default: ;
+                    endcase
+                end
+            end
+        end
+    end
+
+    // ----------------------------------------------------------------
+    // DMA status
+    // ----------------------------------------------------------------
+    wire       dma_busy;
+    wire       dma_done_pulse;
+    reg        done_latch;
+
+    always @(posedge clk_i or posedge rst_i) begin
+        if (rst_i)               done_latch <= 1'b0;
+        else if (reg_ctrl_start) done_latch <= 1'b0;
+        else if (dma_done_pulse) done_latch <= 1'b1;
+    end
+
+    // ----------------------------------------------------------------
+    // dma_top instantiation
+    // ----------------------------------------------------------------
+    dma_top #(.DATA_WIDTH(32),.ADDR_WIDTH(32),.LEN_WIDTH(8),.BUF_DEPTH(256))
+    u_dma_top (
+        .clk              (clk_i),
+        .rst_n            (~rst_i),
+        .ch0_start        (reg_ctrl_start),
+        .ch0_mode         (reg_mode),
+        .ch0_src_addr     (reg_src),
+        .ch0_dst_addr     (reg_dst),
+        .ch0_transfer_len (reg_len),
+        .ch0_busy         (dma_busy),
+        .ch0_done         (dma_done_pulse),
+        .ch1_start        (1'b0),
+        .ch1_mode         (1'b0),
+        .ch1_src_addr     (32'h0),
+        .ch1_dst_addr     (32'h0),
+        .ch1_transfer_len (8'h0),
+        .ch1_busy         (),
+        .ch1_done         (),
+        .bus_read         (dma_bus_read),
+        .bus_write        (dma_bus_write),
+        .bus_addr         (dma_bus_addr),
+        .bus_wdata        (dma_bus_wdata),
+        .bus_rdata        (dma_bus_rdata),
+        .bus_ready        (dma_bus_ready)
+    );
+
+    // ----------------------------------------------------------------
+    // AXI read mux
+    // offset < 0x20  : DMA control registers
+    // offset >= 0x20 : dma_mem[ (offset - 0x20) >> 2 ]
+    // ----------------------------------------------------------------
+    reg [31:0] rd_data_r;
+    always @(*) begin
+        if (cfg_araddr_i[7:0] >= 8'h20) begin
+            rd_data_r = dma_mem[(cfg_araddr_i[7:0] - 8'h20) >> 2];
+        end
+        else begin
+            case (cfg_araddr_i[7:0])
+                `CNT_DMA_SRC:    rd_data_r = reg_src;
+                `CNT_DMA_DST:    rd_data_r = reg_dst;
+                `CNT_DMA_LEN:    rd_data_r = {24'h0, reg_len};
+                `CNT_DMA_MODE:   rd_data_r = {31'h0, reg_mode};
+                `CNT_DMA_CTRL:   rd_data_r = {31'h0, reg_ctrl_start};
+                `CNT_DMA_STATUS: rd_data_r = {30'h0, done_latch, dma_busy};
+                default:         rd_data_r = 32'h0;
+            endcase
+        end
+    end
+
+    reg rvalid_q;
+    always @(posedge clk_i or posedge rst_i)
+        if (rst_i)             rvalid_q <= 1'b0;
+        else if (read_en_w)    rvalid_q <= 1'b1;
+        else if (cfg_rready_i) rvalid_q <= 1'b0;
+    assign cfg_rvalid_o = rvalid_q;
+
+    reg [31:0] rd_data_q;
+    always @(posedge clk_i or posedge rst_i)
+        if (rst_i)
+            rd_data_q <= 32'h0;
+        else if (!cfg_rvalid_o || cfg_rready_i)
+            rd_data_q <= rd_data_r;
+    assign cfg_rdata_o = rd_data_q;
+
+    reg bvalid_q;
+    always @(posedge clk_i or posedge rst_i)
+        if (rst_i)             bvalid_q <= 1'b0;
+        else if (write_en_w)   bvalid_q <= 1'b1;
+        else if (cfg_bready_i) bvalid_q <= 1'b0;
+    assign cfg_bvalid_o = bvalid_q;
+
+    assign count_o = {2'b00, done_latch, dma_busy};
+
+endmodule

@@ -1,0 +1,61 @@
+## Boolean Board XDC Constraints
+## RealDigital Boolean Board - Spartan-7 XC7S50-CSGA324
+##
+## Converted from Arty A7-100T constraints for UART demo
+##==============================================================
+## Bank voltage configuration
+## Boolean board uses 3.3V I/O banks
+##==============================================================
+set_property CFGBVS VCCO [current_design]
+set_property CONFIG_VOLTAGE 3.3 [current_design]
+
+##==============================================================
+## Clock - 100 MHz crystal oscillator
+## Boolean: PACKAGE_PIN F14, Sch=clk_100MHz
+## CHANGED: E3 (Arty A7-100T) -> F14 (Boolean)
+##==============================================================
+set_property -dict { PACKAGE_PIN F14  IOSTANDARD LVCMOS33 } [get_ports { clk100mhz }]
+create_clock -add -name sys_clk_pin -period 10.00 -waveform {0 5} [get_ports { clk100mhz }]
+
+##==============================================================
+## LEDs (active high on Boolean board)
+## Boolean has 16 LEDs [0:15], using first 4 for this design
+## CHANGED: Arty pins (H5,J5,T9,T10) -> Boolean pins (G1,G2,F1,F2)
+##==============================================================
+set_property -dict { PACKAGE_PIN G1  IOSTANDARD LVCMOS33 } [get_ports { led[0] }]
+set_property -dict { PACKAGE_PIN G2  IOSTANDARD LVCMOS33 } [get_ports { led[1] }]
+set_property -dict { PACKAGE_PIN F1  IOSTANDARD LVCMOS33 } [get_ports { led[2] }]
+set_property -dict { PACKAGE_PIN F2  IOSTANDARD LVCMOS33 } [get_ports { led[3] }]
+
+##==============================================================
+## USB-UART Interface (through PROG/UART FT2232H on Boolean)
+##
+## Boolean UART pin assignments from master constraints:
+##   uart_txd = U11  (FPGA sends  -> PC receives) -> uart_rxd_out
+##   uart_rxd = V12  (PC sends    -> FPGA receives) -> uart_txd_in
+##
+## CHANGED: 
+##   Arty D10 (uart_rxd_out) -> Boolean U11 (UART_txd)
+##   Arty A9  (uart_txd_in)  -> Boolean V12 (UART_rxd)
+##
+## NOTE: Port naming follows convention where:
+##   uart_rxd_out = FPGA transmit output (to PC)
+##   uart_txd_in  = FPGA receive input (from PC)
+##==============================================================
+set_property -dict { PACKAGE_PIN U11 IOSTANDARD LVCMOS33 } [get_ports { uart_rxd_out }]
+set_property -dict { PACKAGE_PIN V12 IOSTANDARD LVCMOS33 } [get_ports { uart_txd_in  }]
+
+##==============================================================
+## Timing constraints - unchanged, logic is board-independent
+##==============================================================
+## UART RX is asynchronous - no input timing analysis needed
+set_false_path -from [get_ports { uart_txd_in }]
+
+## UART TX is asynchronous serial - false path is correct and clean
+set_false_path -to [get_ports { uart_rxd_out }]
+
+##==============================================================
+## Bitstream settings
+##==============================================================
+set_property BITSTREAM.GENERAL.COMPRESS TRUE [current_design]
+set_property BITSTREAM.CONFIG.UNUSEDPIN PULLDOWN [current_design]

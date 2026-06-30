@@ -1,0 +1,198 @@
+#include <stdint.h>
+
+/*--------------------------------------------------------------------
+ * UART (0x92000000)
+ *--------------------------------------------------------------------*/
+#define UART_BASE     0x92000000UL
+#define UART_TX_FIFO  (*(volatile uint32_t *)(UART_BASE + 0x04))
+#define UART_STATUS   (*(volatile uint32_t *)(UART_BASE + 0x08))
+#define UART_TX_FULL  0x08
+
+/*--------------------------------------------------------------------
+ * DMA Peripheral Registers (0x95000000)
+ *--------------------------------------------------------------------*/
+#define DMA_BASE      0x95000000UL
+#define DMA_SRC       (*(volatile uint32_t *)(DMA_BASE + 0x00))
+#define DMA_DST       (*(volatile uint32_t *)(DMA_BASE + 0x04))
+#define DMA_LEN       (*(volatile uint32_t *)(DMA_BASE + 0x08))
+#define DMA_MODE      (*(volatile uint32_t *)(DMA_BASE + 0x0C))
+#define DMA_CTRL      (*(volatile uint32_t *)(DMA_BASE + 0x10))
+#define DMA_STATUS    (*(volatile uint32_t *)(DMA_BASE + 0x14))
+
+#define DMA_MEM(n)    (*(volatile uint32_t *)(DMA_BASE + 0x20 + (n)*4))
+
+#define SRC_BASE_ADDR  (DMA_BASE + 0x20)
+#define DST_BASE_ADDR  (DMA_BASE + 0x20 + 16*4)
+
+#define DMA_MODE_SINGLE  0
+#define DMA_MODE_BURST   1
+#define STATUS_BUSY      0x1
+
+/*--------------------------------------------------------------------
+ * Simple LCG random — seeded from leftover destination memory
+ * First run: dest is 0 so seed = 0xDEAD0000 (fixed fallback)
+ * Every run after: dest has last run's data — different seed each time
+ *--------------------------------------------------------------------*/
+static uint32_t rand_state;
+
+static void rand_init(void) {
+    /* Read whatever is sitting in destination memory as seed */
+    uint32_t seed = DMA_MEM(16) ^ DMA_MEM(17) ^ DMA_MEM(18) ^ DMA_MEM(19);
+    if (seed == 0) seed = 0xDEAD0000;  /* fallback for very first run */
+    rand_state = seed;
+}
+
+static uint32_t rand_next(void) {
+    rand_state = rand_state * 1664525u + 1013904223u;
+    return (rand_state >> 16) & 0xFF;  /* 0-255, easy to read */
+}
+
+/*--------------------------------------------------------------------
+ * Helpers
+ *--------------------------------------------------------------------*/
+static void delay(volatile uint32_t n) { while (n--) __asm__("nop"); }
+
+static void putc_uart(char c) {
+    while (UART_STATUS & UART_TX_FULL);
+    UART_TX_FIFO = (uint32_t)c;
+}
+
+static void print(const char *s) {
+    while (*s) putc_uart(*s++);
+}
+
+static void print_hex32(uint32_t v) {
+    char buf[11];
+    buf[0] = '0'; buf[1] = 'x';
+    for (int i = 9; i >= 2; i--) {
+        uint8_t nib = v & 0xF;
+        buf[i] = (nib < 10) ? ('0' + nib) : ('A' + nib - 10);
+        v >>= 4;
+    }
+    buf[10] = '\0';
+    print(buf);
+}
+
+static void print_dec(uint32_t v) {
+    if (v == 0) { putc_uart('0'); return; }
+    char buf[12]; int i = 11; buf[i] = '\0';
+    while (v) { buf[--i] = '0' + (v % 10); v /= 10; }
+    print(&buf[i]);
+}
+
+static int dma_wait(void) {
+    volatile uint32_t t = 500000UL;
+    while ((DMA_STATUS & STATUS_BUSY) && t > 0) { t--; delay(5); }
+    DMA_CTRL = 0;
+    return (t > 0) ? 1 : 0;
+}
+
+static void print_mem(uint32_t base_addr, int start_word, int count) {
+    for (int i = 0; i < count; i++) {
+        print("    [");
+        print_hex32(base_addr + i * 4);
+        print("] = ");
+        print_dec(DMA_MEM(start_word + i));
+        print("\r\n");
+    }
+}
+
+static int dma_run(uint32_t src_off, uint32_t dst_off,
+                   uint32_t len, uint32_t mode) {
+    DMA_SRC  = src_off;
+    DMA_DST  = dst_off;
+    DMA_LEN  = len;
+    DMA_MODE = mode;
+    delay(200);
+    DMA_CTRL = 1u;
+    return dma_wait();
+}
+
+/*====================================================================
+ * main
+ *====================================================================*/
+int main(void) {
+    delay(200000);
+
+    /* Seed RNG from whatever is in destination memory right now */
+    rand_init();
+
+    print("\r\n");
+    print("============================================\r\n");
+    print("  Dual-Channel DMA Controller Demo\r\n");
+    print("  RISC-V SoC | Boolean Board\r\n");
+    print("============================================\r\n");
+    print("DMA Start\r\n\r\n");
+
+    /*==================================================================
+     * SINGLE MODE
+     * Source: 4 random words, different every run
+     * Dest  : NOT cleared — shows previous run's transferred data
+     *==================================================================*/
+    print("-- SINGLE Mode --\r\n");
+    print("  One word read then written at a time\r\n\r\n");
+
+    DMA_MEM(0) = rand_next();
+    DMA_MEM(1) = rand_next();
+    DMA_MEM(2) = rand_next();
+    DMA_MEM(3) = rand_next();
+
+    print("  Source (random this run):\r\n");
+    print_mem(SRC_BASE_ADDR, 0, 4);
+
+    print("  Destination BEFORE DMA (data from previous run):\r\n");
+    print_mem(DST_BASE_ADDR, 16, 4);
+
+    print("  Starting SINGLE DMA Transfer...\r\n");
+    print("  SRC="); print_hex32(SRC_BASE_ADDR);
+    print("  DST="); print_hex32(DST_BASE_ADDR);
+    print("  LEN=4 words\r\n");
+
+    int ok1 = dma_run(0x000, 0x040, 4, DMA_MODE_SINGLE);
+
+    print("  Destination AFTER DMA (overwritten with new data):\r\n");
+    print_mem(DST_BASE_ADDR, 16, 4);
+    print(ok1 ? "  SINGLE Mode: PASS\r\n\r\n"
+              : "  SINGLE Mode: TIMEOUT\r\n\r\n");
+
+    /*==================================================================
+     * BURST MODE
+     * Source: 8 random words, different every run
+     * Dest  : NOT cleared — shows previous run's transferred data
+     *==================================================================*/
+    print("-- BURST Mode --\r\n");
+    print("  All reads into buffer first, then all writes at once\r\n\r\n");
+
+    for (int i = 0; i < 8; i++) DMA_MEM(i) = rand_next();
+
+    print("  Source (random this run):\r\n");
+    print_mem(SRC_BASE_ADDR, 0, 8);
+
+    print("  Destination BEFORE DMA (data from previous run):\r\n");
+    print_mem(DST_BASE_ADDR, 16, 8);
+
+    print("  Starting BURST DMA Transfer...\r\n");
+    print("  SRC="); print_hex32(SRC_BASE_ADDR);
+    print("  DST="); print_hex32(DST_BASE_ADDR);
+    print("  LEN=8 words\r\n");
+
+    int ok2 = dma_run(0x000, 0x040, 8, DMA_MODE_BURST);
+
+    print("  Destination AFTER DMA (overwritten with new data):\r\n");
+    print_mem(DST_BASE_ADDR, 16, 8);
+    print(ok2 ? "  BURST Mode: PASS\r\n\r\n"
+              : "  BURST Mode: TIMEOUT\r\n\r\n");
+
+    /*------------------------------------------------------------------
+     * Summary
+     *------------------------------------------------------------------*/
+    print("============================================\r\n");
+    if (ok1 && ok2)
+        print("  DMA Copy Successful\r\n");
+    else
+        print("  One or more transfers failed\r\n");
+    print("  DMA Done\r\n");
+    print("============================================\r\n");
+
+    return 0;
+}
